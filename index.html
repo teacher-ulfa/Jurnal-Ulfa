@@ -750,7 +750,7 @@ XII-9	12101	ACHMAD FAHRI AL AZHAR	L
             loadCustomRombelFromStorage();
             populateBabDropdown("X");
             handleClassChange("X-2");
-            // Otomatis tarik data siswa dari spreadsheet publik
+            // Otomatis tarik data siswa dari spreadsheet publik dengan multi-metode
             syncFromGoogleSheet(false);
         };
 
@@ -777,6 +777,261 @@ XII-9	12101	ACHMAD FAHRI AL AZHAR	L
                 }
             } catch (e) {
                 console.warn("Gagal memuat cache siswa", e);
+            }
+        }
+
+        // ========================================================
+        // 2. SINKRONISASI DATA SISWA DARI GOOGLE SPREADSHEET (MULTI-METODE & BEBAS CORS)
+        // ========================================================
+        async function syncFromGoogleSheet(isManual = false) {
+            const badge = document.getElementById('syncStatusBadge');
+            const icon = document.getElementById('syncBadgeIcon');
+            const text = document.getElementById('syncBadgeText');
+
+            if (badge) badge.classList.remove('hidden');
+            if (icon) icon.className = 'fa-solid fa-arrows-rotate fa-spin text-brand-600';
+            if (text) text.textContent = 'Menghubungkan Spreadsheet...';
+
+            // METODE 1: Google Visualization API via JSONP (Bebas CORS, jalan di semua browser & GitHub)
+            try {
+                const countJSONP = await fetchStudentsViaJSONP();
+                if (countJSONP > 0) {
+                    if (icon) icon.className = 'fa-solid fa-cloud-check text-emerald-600';
+                    if (text) text.textContent = `Tersinkron (${countJSONP} Siswa)`;
+                    if (isManual) showToast(`Berhasil! ${countJSONP} siswa untuk 8 kelas berhasil disinkronkan.`);
+                    return;
+                }
+            } catch (errJsonp) {
+                console.warn("Metode 1 (JSONP) gagal, mencoba metode alternatif...", errJsonp);
+            }
+
+            // METODE 2: Fetch CSV Langsung
+            let rawData = null;
+            try {
+                const gvizUrl = `https://docs.google.com/spreadsheets/d/${STUDENT_SPREADSHEET_ID}/gviz/tq?tqx=out:csv`;
+                const res = await fetch(gvizUrl);
+                if (res.ok) {
+                    rawData = await res.text();
+                }
+            } catch (e1) {
+                console.warn("Fetch CSV langsung gagal (CORS browser), mencoba export...", e1);
+            }
+
+            if (!rawData || rawData.length < 30) {
+                try {
+                    const exportUrl = `https://docs.google.com/spreadsheets/d/${STUDENT_SPREADSHEET_ID}/export?format=csv`;
+                    const res2 = await fetch(exportUrl);
+                    if (res2.ok) rawData = await res2.text();
+                } catch (e2) {
+                    console.warn("Fetch export CSV juga terhalang CORS", e2);
+                }
+            }
+
+            if (rawData && rawData.length >= 30) {
+                const count = parseAndApplyCsv(rawData);
+                if (count > 0) {
+                    if (icon) icon.className = 'fa-solid fa-cloud-check text-emerald-600';
+                    if (text) text.textContent = `Tersinkron (${count} Siswa)`;
+                    if (isManual) showToast(`Berhasil! ${count} siswa berhasil dimuat.`);
+                    return;
+                }
+            }
+
+            // Jika semua fetch otomatis terhambat keamanan browser lokal
+            if (icon) icon.className = 'fa-solid fa-circle-exclamation text-amber-500';
+            if (text) text.textContent = 'Tempel CSV Siswa';
+            if (isManual) {
+                showToast("Akses otomatis dibatasi browser. Silakan klik tombol 'Tempel CSV' untuk menyalin data dari spreadsheet.");
+                openImportModal();
+            }
+        }
+
+        // Helper JSONP Google Visualization (Menghindari batasan CORS di browser)
+        function fetchStudentsViaJSONP() {
+            return new Promise((resolve, reject) => {
+                const callbackName = 'googleDocCallback_' + Math.floor(Math.random() * 1000000);
+                const script = document.createElement('script');
+                const timeout = setTimeout(() => {
+                    cleanup();
+                    reject(new Error("Timeout mengambil data siswa"));
+                }, 8000);
+
+                function cleanup() {
+                    clearTimeout(timeout);
+                    if (script.parentNode) script.parentNode.removeChild(script);
+                    delete window[callbackName];
+                }
+
+                window[callbackName] = function(json) {
+                    cleanup();
+                    try {
+                        const table = json.table;
+                        if (!table || !table.rows) {
+                            resolve(0);
+                            return;
+                        }
+
+                        const newDb = {
+                            "X-1": [], "X-2": [], "X-3": [], "X-4": [],
+                            "XII-9": [], "XII-10": [], "XII-11": [], "XII-12": []
+                        };
+
+                        table.rows.forEach(row => {
+                            if (!row.c) return;
+                            const colVals = row.c.map(cell => (cell && cell.v !== undefined && cell.v !== null) ? String(cell.v).trim() : "");
+                            if (colVals.length < 3) return;
+
+                            // Kolom: Kelas, NIS/NISN, Nama, L/P
+                            const rawKelas = colVals[0];
+                            const matchedKelas = normalizeKelasName(rawKelas);
+
+                            if (matchedKelas) {
+                                const nis = colVals[1] || "-";
+                                const nama = colVals[2] ? colVals[2].toUpperCase() : "";
+                                let lp = colVals[3] ? colVals[3].toUpperCase() : "L";
+                                if (lp.startsWith("P")) lp = "P"; else lp = "L";
+
+                                if (nama && !nama.includes("NAMA SISWA") && !nama.includes("NAMA")) {
+                                    newDb[matchedKelas].push({
+                                        no: newDb[matchedKelas].length + 1,
+                                        nisn: nis,
+                                        nama: nama,
+                                        lp: lp
+                                    });
+                                }
+                            }
+                        });
+
+                        let total = 0;
+                        for (let k in newDb) {
+                            if (newDb[k].length > 0) {
+                                rombelDatabase[k] = newDb[k];
+                                total += newDb[k].length;
+                            }
+                        }
+
+                        if (total > 0) {
+                            localStorage.setItem('jurnal_pai_custom_rombel_db', JSON.stringify(rombelDatabase));
+                            handleClassChange(currentClass);
+                            resolve(total);
+                        } else {
+                            resolve(0);
+                        }
+                    } catch (e) {
+                        reject(e);
+                    }
+                };
+
+                script.src = `https://docs.google.com/spreadsheets/d/${STUDENT_SPREADSHEET_ID}/gviz/tq?tqx=responseHandler:${callbackName}`;
+                script.onerror = function() {
+                    cleanup();
+                    reject(new Error("Gagal memuat script JSONP Google Spreadsheet"));
+                };
+                document.head.appendChild(script);
+            });
+        }
+
+        // Normalizer nama kelas cerdas (Mendukung: X-1, X.1, X 1, X1, KELAS X-1, XII-9, XII 9, dsb)
+        function normalizeKelasName(raw) {
+            if (!raw) return null;
+            let str = raw.toUpperCase()
+                         .replace(/^KELAS\s*/i, '')
+                         .replace(/[\s\.\_\/]/g, '-')
+                         .trim();
+
+            const validList = ["X-1", "X-2", "X-3", "X-4", "XII-9", "XII-10", "XII-11", "XII-12"];
+            for (let v of validList) {
+                const strippedV = v.replace('-', '');
+                const strippedStr = str.replace('-', '');
+                if (str === v || strippedStr === strippedV) {
+                    return v;
+                }
+            }
+            return null;
+        }
+
+        // Parser CSV/TSV fleksibel untuk format: Kelas, NIS, Nama, L/P
+        function parseAndApplyCsv(text) {
+            const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+            if (lines.length === 0) return 0;
+
+            const newDb = {
+                "X-1": [], "X-2": [], "X-3": [], "X-4": [],
+                "XII-9": [], "XII-10": [], "XII-11": [], "XII-12": []
+            };
+
+            lines.forEach(line => {
+                let parts = [];
+                if (line.includes('\t')) {
+                    parts = line.split('\t');
+                } else if (line.includes(';')) {
+                    parts = line.split(';');
+                } else {
+                    parts = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+                }
+
+                parts = parts.map(p => p.replace(/^["']|["']$/g, '').trim());
+
+                if (parts.length >= 3) {
+                    const matchedKelas = normalizeKelasName(parts[0]);
+
+                    if (matchedKelas) {
+                        const nisn = parts[1] || "-";
+                        const nama = parts[2] ? parts[2].toUpperCase() : "-";
+                        let lp = parts[3] ? parts[3].toUpperCase() : "L";
+                        lp = lp.startsWith("P") ? "P" : "L";
+
+                        // Abaikan baris header judul
+                        if (!nama.includes("NAMA SISWA") && !nama.includes("NAMA")) {
+                            newDb[matchedKelas].push({
+                                no: newDb[matchedKelas].length + 1,
+                                nisn: nisn,
+                                nama: nama,
+                                lp: lp
+                            });
+                        }
+                    }
+                }
+            });
+
+            let totalLoaded = 0;
+            const validClasses = ["X-1", "X-2", "X-3", "X-4", "XII-9", "XII-10", "XII-11", "XII-12"];
+            for (let c of validClasses) {
+                if (newDb[c] && newDb[c].length > 0) {
+                    rombelDatabase[c] = newDb[c];
+                    totalLoaded += newDb[c].length;
+                }
+            }
+
+            if (totalLoaded > 0) {
+                localStorage.setItem('jurnal_pai_custom_rombel_db', JSON.stringify(rombelDatabase));
+                handleClassChange(currentClass);
+                return totalLoaded;
+            }
+
+            return 0;
+        }
+
+        function openImportModal() {
+            document.getElementById('studentImportModal').classList.remove('hidden');
+        }
+
+        function closeImportModal() {
+            document.getElementById('studentImportModal').classList.add('hidden');
+        }
+
+        function applyPastedData() {
+            const raw = document.getElementById('rawCsvInput').value.trim();
+            if (!raw) {
+                showToast("Silakan tempel teks data siswa terlebih dahulu!");
+                return;
+            }
+            const count = parseAndApplyCsv(raw);
+            if (count > 0) {
+                closeImportModal();
+                showToast(`Berhasil! ${count} data siswa untuk seluruh kelas berhasil diterapkan!`);
+            } else {
+                showToast("Format teks belum cocok. Pastikan ada baris: Kelas [tab/koma] NIS [tab/koma] Nama [tab/koma] L/P");
             }
         }
 
